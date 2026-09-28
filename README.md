@@ -1,10 +1,12 @@
 # 火柴人格斗 · Stick Fighter
 
-一个纯前端的火柴人格斗小游戏，单个 HTML 文件即可运行，物理引擎用 Matter.js。
+一个纯前端的火柴人格斗小游戏，单文件即可运行，物理引擎用 Matter.js（已内嵌，离线可玩）。
 
 ## 运行方式
 
-双击 `stick-fighter.html` 在浏览器打开即可（首次加载需联网，Matter.js 走 CDN）。
+直接双击 `index.html` 在浏览器打开即可，无需联网。
+
+也可以在线玩：https://zouj878.github.io/stick-fighter/
 
 ## 玩法
 
@@ -32,4 +34,4 @@
 ## 技术栈
 
 - 原生 JavaScript + HTML5 Canvas
-- [Matter.js](https://brm.io/matter-js/) 物理引擎
+- [Matter.js](https://brm.io/matter-js/) 物理引擎（已内嵌）
