@@ -2,17 +2,81 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>火柴人格斗 · Stick Fighter</title>
 <style>
   html, body { margin: 0; height: 100%; background: #0b0d14; overflow: hidden;
     font-family: system-ui, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
   #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
-  canvas { background: #151824; border-radius: 6px; box-shadow: 0 0 60px rgba(0,0,0,.6); }
+  #stage { position: relative; }
+  canvas { background: #151824; border-radius: 6px; box-shadow: 0 0 60px rgba(0,0,0,.6); touch-action: manipulation; }
+
+  #touch { position: absolute; inset: 0; pointer-events: none; }
+  #touch.hidden { display: none; }
+  .tbtn {
+    position: absolute; width: 62px; height: 62px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
+    color: #fff; font-size: 20px; font-weight: 600; outline: none;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: auto; user-select: none; -webkit-user-select: none;
+    touch-action: none; -webkit-tap-highlight-color: transparent;
+  }
+  .tbtn.pressed, .tbtn:active { background: rgba(255,255,255,0.30); border-color: rgba(255,255,255,0.7); }
+  .t-left  { left: 5%;  bottom: 9%; }
+  .t-right { left: 20%; bottom: 9%; }
+  .t-jump  { left: 12.5%; bottom: 22%; }
+  .t-punch { right: 20%; bottom: 22%; }
+  .t-kick  { right: 5%;  bottom: 22%; }
+  .t-wave  { right: 20%; bottom: 9%; }
+  .t-block { right: 5%;  bottom: 9%; }
+
+  #menuModeBtns, #menuMapBtns {
+    position: absolute; inset: 0; pointer-events: none;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+  }
+  .mbtn {
+    min-width: 220px; padding: 16px 24px; font-size: 22px; font-weight: 600; outline: none;
+    border-radius: 14px; border: 2px solid rgba(255,255,255,0.35);
+    background: rgba(0,0,0,0.4); color: #fff;
+    pointer-events: auto; user-select: none; -webkit-user-select: none;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  .mbtn:active { background: rgba(255,255,255,0.2); }
+
+  #rotateHint { display: none; position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,0.88); color: #fff; font-size: 22px;
+    align-items: center; justify-content: center; text-align: center; }
+  @media (orientation: portrait) and (pointer: coarse) { #rotateHint { display: flex; } }
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c"></canvas></div>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="touch" class="hidden">
+      <div id="gameBtns" style="display:none">
+        <button class="tbtn t-left" data-a="left" data-hold="1">◀</button>
+        <button class="tbtn t-right" data-a="right" data-hold="1">▶</button>
+        <button class="tbtn t-jump" data-a="jump">跳</button>
+        <button class="tbtn t-punch" data-a="punch">拳</button>
+        <button class="tbtn t-kick" data-a="kick">踢</button>
+        <button class="tbtn t-wave" data-a="wave">波</button>
+        <button class="tbtn t-block" data-a="block" data-hold="1">挡</button>
+      </div>
+      <div id="menuModeBtns" style="display:none">
+        <button class="mbtn" data-m="pvp">双人对战</button>
+        <button class="mbtn" data-m="cpu">单人打电脑</button>
+      </div>
+      <div id="menuMapBtns" style="display:none">
+        <button class="mbtn" data-map="arena">擂台</button>
+        <button class="mbtn" data-map="platform">平台</button>
+        <button class="mbtn" data-map="cliff">悬崖（掉坑扣血）</button>
+        <button class="mbtn" data-back="1">返回</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="rotateHint">请将手机横屏游玩 🔄</div>
 <script>
 /*!
  * matter-js 0.19.0 by @liabru
@@ -62,7 +126,7 @@ const MAX_ENERGY = 100, WAVE_COST = 40, ENERGY_REGEN = 18;
 const WAVE_SPEED = 600; // 像素/秒（角色移速约 242，波约 2.5 倍）
 
 const INPUT = {
-  p1: { left: ['KeyA'], right: ['KeyD'], jump: 'KeyW', punch: 'KeyF', kick: 'KeyG', wave: 'KeyH', block: ['KeyS'] },
+  p1: { left: ['KeyA', 'T:P1:left'], right: ['KeyD', 'T:P1:right'], jump: 'KeyW', punch: 'KeyF', kick: 'KeyG', wave: 'KeyH', block: ['KeyS', 'T:P1:block'] },
   p2: { left: ['ArrowLeft'], right: ['ArrowRight'], jump: 'ArrowUp', punch: 'KeyK', kick: 'KeyL', wave: 'KeyJ', block: ['ArrowDown'] },
 };
 
@@ -159,6 +223,7 @@ function startGame(m, mapKey) {
   fighters[0].facing = 1; fighters[1].facing = -1;
   projectiles = []; particles = [];
   gameOver = false; winner = null; hitStop = 0; shake = 0;
+  clearTouchTokens();
 }
 
 /* ============================= 输入 ============================= */
@@ -189,16 +254,73 @@ addEventListener('keydown', e => {
   }
   for (const f of fighters) {
     if (f.isAI) continue;
-    if (e.code === f.input.jump) tryJump(f);
-    if (e.code === f.input.punch) startAttack(f, 'punch');
-    if (e.code === f.input.kick)  startAttack(f, 'kick');
-    if (e.code === f.input.wave)  fireWave(f);
+    if (e.code === f.input.jump) pressEdge(f, 'jump');
+    if (e.code === f.input.punch) pressEdge(f, 'punch');
+    if (e.code === f.input.kick)  pressEdge(f, 'kick');
+    if (e.code === f.input.wave)  pressEdge(f, 'wave');
   }
 });
 addEventListener('keyup', e => keys.delete(e.code));
 addEventListener('blur', () => keys.clear());
 
 function isDown(f, dir) { return f.input[dir].some(k => keys.has(k)); }
+
+function pressEdge(f, action) {
+  if (action === 'jump') tryJump(f);
+  else if (action === 'punch') startAttack(f, 'punch');
+  else if (action === 'kick') startAttack(f, 'kick');
+  else if (action === 'wave') fireWave(f);
+}
+
+/* ============================= 触屏按键 ============================= */
+const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+
+function clearTouchTokens() {
+  for (const k of [...keys]) if (k.startsWith('T:P1:')) keys.delete(k);
+}
+
+let lastScreen = null;
+function updateTouchUI() {
+  if (screen === lastScreen) return;
+  lastScreen = screen;
+  const touch = document.getElementById('touch');
+  const game = document.getElementById('gameBtns');
+  const modeEl = document.getElementById('menuModeBtns');
+  const mapEl = document.getElementById('menuMapBtns');
+  if (!isTouch) { touch.classList.add('hidden'); return; }
+  touch.classList.remove('hidden');
+  game.style.display = screen === 'game' ? '' : 'none';
+  modeEl.style.display = screen === 'menu' ? '' : 'none';
+  mapEl.style.display = screen === 'mapselect' ? '' : 'none';
+  if (screen !== 'game') clearTouchTokens();
+}
+
+function setupTouch() {
+  if (!isTouch) return;
+  document.querySelectorAll('#gameBtns .tbtn').forEach(btn => {
+    const a = btn.dataset.a, hold = btn.dataset.hold === '1', token = 'T:P1:' + a;
+    const down = (e) => { e.preventDefault(); try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+      btn.classList.add('pressed');
+      if (screen !== 'game' || gameOver) return;
+      if (hold) keys.add(token); else pressEdge(fighters[0], a); };
+    const up = (e) => { e.preventDefault(); btn.classList.remove('pressed'); if (hold) keys.delete(token); };
+    btn.addEventListener('pointerdown', down);
+    btn.addEventListener('pointerup', up);
+    btn.addEventListener('pointercancel', up);
+    btn.addEventListener('pointerleave', up);
+  });
+  document.querySelectorAll('#menuModeBtns .mbtn').forEach(btn => {
+    btn.addEventListener('pointerdown', (e) => { e.preventDefault();
+      if (screen !== 'menu') return; mode = btn.dataset.m; screen = 'mapselect'; updateTouchUI(); });
+  });
+  document.querySelectorAll('#menuMapBtns .mbtn').forEach(btn => {
+    btn.addEventListener('pointerdown', (e) => { e.preventDefault();
+      if (btn.dataset.back) { screen = 'menu'; updateTouchUI(); }
+      else if (screen === 'mapselect') startGame(mode, btn.dataset.map);
+    });
+  });
+}
+setupTouch();
 
 /* ============================= 动作 ============================= */
 function tryJump(f) {
@@ -790,6 +912,7 @@ const playKO    = () => { blip(440, 110, 0.3, 0.4); setTimeout(() => blip(330, 8
 let last = performance.now();
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  updateTouchUI();
 
   if (screen === 'game') {
     if (hitStop > 0) hitStop -= dt;
