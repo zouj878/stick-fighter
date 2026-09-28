@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>火柴人格斗 · Stick Fighter</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d14; overflow: hidden;
+    font-family: system-ui, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { background: #151824; border-radius: 6px; box-shadow: 0 0 60px rgba(0,0,0,.6); }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script src="https://cdn.jsdelivr.net/npm/matter-js@0.19.0/build/matter.min.js"></script>
+<script>
+/* ============================= 基础设置 ============================= */
+const { Engine, Bodies, Body, Composite, Events } = Matter;
+
+const W = 1280, H = 720;
+const GROUND_H = 40, GROUND_Y = H - GROUND_H; // 地面顶边 y = 680
+const BH = 116, BH_HALF = 58;                 // 角色碰撞箱（高 / 半高）
+
+const c = document.getElementById('c');
+c.width = W; c.height = H;
+const ctx = c.getContext('2d');
+
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  c.style.width  = (W * s) + 'px';
+  c.style.height = (H * s) + 'px';
+}
+addEventListener('resize', fit); fit();
+
+const engine = Engine.create({ gravity: { x: 0, y: 1.4 } });
+let staticBodies = [];
+
+/* ============================= 工具函数 ============================= */
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* ============================= 数值定义 ============================= */
+const MAX_ENERGY = 100, WAVE_COST = 40, ENERGY_REGEN = 18;
+const WAVE_SPEED = 600; // 像素/秒（角色移速约 242，波约 2.5 倍）
+
+const INPUT = {
+  p1: { left: ['KeyA'], right: ['KeyD'], jump: 'KeyW', punch: 'KeyF', kick: 'KeyG', wave: 'KeyH', block: ['KeyS'] },
+  p2: { left: ['ArrowLeft'], right: ['ArrowRight'], jump: 'ArrowUp', punch: 'KeyK', kick: 'KeyL', wave: 'KeyJ', block: ['ArrowDown'] },
+};
+
+const ATK = {
+  punch1: { total: 0.30, active: [0.05, 0.14], dmg: 8,  kb: 4, kbUp: 2, range: 60, size: 32, yOff: -24 },
+  punch2: { total: 0.30, active: [0.05, 0.14], dmg: 9,  kb: 5, kbUp: 3, range: 64, size: 34, yOff: -24 },
+  punch3: { total: 0.42, active: [0.06, 0.16], dmg: 16, kb: 9, kbUp: 6, range: 74, size: 40, yOff: -24 },
+  kick:   { total: 0.44, active: [0.08, 0.22], dmg: 13, kb: 8, kbUp: 5, range: 72, size: 42, yOff: 8   },
+  wave:   { dmg: 14, kb: 7, kbUp: 5 },
+};
+
+// 地图定义：groundSegs 地面段 / platforms 平台(顶边y) / pits 悬崖坑 / killY 掉坑判定线
+const MAPS = {
+  arena: {
+    name: '擂台', killY: H + 200, spawns: [{ x: 360 }, { x: 920 }],
+    groundSegs: [{ x: W/2, w: W }], platforms: [], pits: [],
+  },
+  platform: {
+    name: '平台', killY: H + 200, spawns: [{ x: 260 }, { x: 1020 }],
+    groundSegs: [{ x: W/2, w: W }],
+    platforms: [{ x: 320, y: 560, w: 220 }, { x: 960, y: 560, w: 220 }, { x: 640, y: 470, w: 240 }],
+    pits: [],
+  },
+  cliff: {
+    name: '悬崖', killY: H + 30, spawns: [{ x: 280 }, { x: 1000 }],
+    groundSegs: [{ x: 290, w: 580 }, { x: 990, w: 580 }], // 中间留 120 宽的坑
+    platforms: [], pits: [{ x: 580, w: 120 }],
+  },
+};
+
+let currentMap = MAPS.arena, currentMapKey = 'arena';
+
+/* ============================= 角色 ============================= */
+function createFighter(x, name, color, input, isAI) {
+  const body = Bodies.rectangle(x, GROUND_Y - BH_HALF, 44, BH, {
+    friction: 0, restitution: 0, density: 0.001, label: name,
+  });
+  body.isFighter = true;
+  Body.setInertia(body, Infinity);
+  Composite.add(engine.world, body);
+
+  return {
+    name, color, input, isAI, body,
+    facing: 1,
+    hp: 100, maxHp: 100, dispHp: 100,
+    energy: 100,
+    state: 'idle', stateTime: 0,
+    attack: null, cooldown: 0,
+    walkPhase: 0, onGround: false, onPlatform: false, hurtFlash: 0,
+    combo: 0, comboTimer: 0,
+    hitStreak: 0, hitStreakTimer: 0,
+    invuln: 0, prevY: GROUND_Y - BH_HALF,
+    aiMove: 0, ai: { timer: 0, action: 'idle', move: 0, block: false, attackCooldown: 0 },
+  };
+}
+
+let fighters = [];
+let projectiles = [];
+let particles = [];
+let mode = 'pvp';
+let screen = 'menu'; // menu | mapselect | game
+let gameOver = false, winner = null;
+let hitStop = 0, shake = 0;
+
+function other(f) { return f === fighters[0] ? fighters[1] : fighters[0]; }
+
+function buildMap(mapKey) {
+  staticBodies.forEach(b => Composite.remove(engine.world, b));
+  staticBodies = [];
+  const map = MAPS[mapKey];
+
+  const wl = Bodies.rectangle(-20, H/2, 40, H*2, { isStatic: true, label: 'wall' }); wl.kind = 'wall';
+  const wr = Bodies.rectangle(W+20, H/2, 40, H*2, { isStatic: true, label: 'wall' }); wr.kind = 'wall';
+  staticBodies.push(wl, wr);
+
+  for (const seg of map.groundSegs) {
+    const b = Bodies.rectangle(seg.x, GROUND_Y + GROUND_H/2, seg.w, GROUND_H, { isStatic: true, friction: 0.9, label: 'ground' });
+    b.kind = 'ground';
+    staticBodies.push(b);
+  }
+  Composite.add(engine.world, staticBodies);
+}
+
+function startGame(m, mapKey) {
+  mode = m; currentMapKey = mapKey; currentMap = MAPS[mapKey];
+  buildMap(mapKey);
+  screen = 'game';
+  fighters.forEach(f => Composite.remove(engine.world, f.body));
+  const spawns = currentMap.spawns;
+  fighters = [
+    createFighter(spawns[0].x, '玩家 1', '#ff5252', INPUT.p1, false),
+    createFighter(spawns[1].x, m === 'cpu' ? '电脑' : '玩家 2', '#4f8cff', INPUT.p2, m === 'cpu'),
+  ];
+  fighters[0].facing = 1; fighters[1].facing = -1;
+  projectiles = []; particles = [];
+  gameOver = false; winner = null; hitStop = 0; shake = 0;
+}
+
+/* ============================= 输入 ============================= */
+const keys = new Set();
+const PREVENT = new Set(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space','KeyW','KeyA','KeyD','KeyS','KeyF','KeyG','KeyH','KeyK','KeyL','KeyJ']);
+
+addEventListener('keydown', e => {
+  if (PREVENT.has(e.code)) e.preventDefault();
+  keys.add(e.code);
+  initAudio();
+
+  if (screen === 'menu') {
+    if (e.code === 'Digit1' || e.code === 'Numpad1') { mode = 'pvp'; screen = 'mapselect'; }
+    if (e.code === 'Digit2' || e.code === 'Numpad2') { mode = 'cpu'; screen = 'mapselect'; }
+    return;
+  }
+  if (screen === 'mapselect') {
+    if (e.code === 'Digit1' || e.code === 'Numpad1') startGame(mode, 'arena');
+    if (e.code === 'Digit2' || e.code === 'Numpad2') startGame(mode, 'platform');
+    if (e.code === 'Digit3' || e.code === 'Numpad3') startGame(mode, 'cliff');
+    if (e.code === 'Escape') screen = 'menu';
+    return;
+  }
+  if (gameOver) {
+    if (e.code === 'KeyR') startGame(mode, currentMapKey);
+    if (e.code === 'Escape') { screen = 'menu'; gameOver = false; }
+    return;
+  }
+  for (const f of fighters) {
+    if (f.isAI) continue;
+    if (e.code === f.input.jump) tryJump(f);
+    if (e.code === f.input.punch) startAttack(f, 'punch');
+    if (e.code === f.input.kick)  startAttack(f, 'kick');
+    if (e.code === f.input.wave)  fireWave(f);
+  }
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+
+function isDown(f, dir) { return f.input[dir].some(k => keys.has(k)); }
+
+/* ============================= 动作 ============================= */
+function tryJump(f) {
+  if (f.state === 'hurt' || f.state === 'punch' || f.state === 'kick' || f.state === 'wave') return;
+  if (!f.onGround) return;
+  Body.setVelocity(f.body, { x: f.body.velocity.x, y: -11.6 });
+  f.onGround = false; f.onPlatform = false;
+}
+
+function startAttack(f, type) {
+  if (gameOver || f.state === 'hurt' || f.cooldown > 0) return;
+  let def;
+  if (type === 'punch') {
+    f.combo = (f.comboTimer > 0 ? f.combo + 1 : 0) % 3;
+    f.comboTimer = 0.55;
+    def = ATK['punch' + (f.combo + 1)];
+    if (f.combo === 2) Body.setVelocity(f.body, { x: f.facing * 7, y: f.body.velocity.y });
+  } else {
+    f.combo = 0; f.comboTimer = 0;
+    def = ATK[type];
+  }
+  f.state = type;
+  f.stateTime = 0;
+  f.attack = { type, hitDone: false, ...def };
+}
+
+function fireWave(f) {
+  if (gameOver || f.state === 'hurt' || f.cooldown > 0) return;
+  if (f.energy < WAVE_COST) return;
+  f.energy -= WAVE_COST;
+  f.state = 'wave'; f.stateTime = 0; f.attack = null;
+  projectiles.push({
+    x: f.body.position.x + f.facing * 24, y: f.body.position.y - 12,
+    vx: f.facing * WAVE_SPEED, owner: f, life: 2.2, r: 11,
+  });
+  playWave();
+}
+
+function hitTest(f, foe, a) {
+  const cx = f.body.position.x + f.facing * (a.range / 2 + 8);
+  const cy = f.body.position.y + a.yOff;
+  const hw = a.range / 2, hh = a.size / 2;
+  const b = foe.body.bounds;
+  return cx + hw > b.min.x && cx - hw < b.max.x &&
+         cy + hh > b.min.y && cy - hh < b.max.y;
+}
+
+function applyHit(foe, f, a) {
+  if (foe.invuln > 0) return;
+  const blocked = foe.state === 'block';
+  const dmg  = blocked ? Math.max(1, Math.round(a.dmg * 0.2)) : a.dmg;
+  const kb   = blocked ? a.kb * 0.25 : a.kb;
+  const kbUp = blocked ? a.kbUp * 0.3 : a.kbUp;
+
+  foe.hp = Math.max(0, foe.hp - dmg);
+  Body.setVelocity(foe.body, { x: f.facing * kb, y: -kbUp });
+
+  if (blocked) {
+    foe.hurtFlash = 0.1;
+    spawnBurst(foe.body.position.x + f.facing * 22, foe.body.position.y - 10, '#9fd8ff', 6);
+    shake = Math.max(shake, 2); playBlock();
+  } else {
+    foe.state = 'hurt'; foe.stateTime = 0; foe.attack = null; foe.hurtFlash = 0.15;
+    foe.combo = 0; foe.comboTimer = 0;
+    foe.hitStreak = 0; foe.hitStreakTimer = 0;
+    f.hitStreak = (f.hitStreakTimer > 0 ? f.hitStreak + 1 : 1);
+    f.hitStreakTimer = 1.1;
+    spawnBurst(foe.body.position.x, foe.body.position.y - 10, f.color, 8);
+    hitStop = 0.055; shake = 6; playHit();
+  }
+
+  if (foe.hp <= 0) { gameOver = true; winner = f; playKO(); }
+}
+
+function spawnBurst(x, y, color, n = 12) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 4;
+    particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 1,
+      life: 0.4 + Math.random() * 0.3, r: 2 + Math.random() * 3, color });
+  }
+}
+
+function respawnFighter(f) {
+  const spawn = currentMap.spawns[f === fighters[0] ? 0 : 1];
+  Body.setPosition(f.body, { x: spawn.x, y: GROUND_Y - BH_HALF });
+  Body.setVelocity(f.body, { x: 0, y: 0 });
+  f.state = 'idle'; f.stateTime = 0; f.attack = null; f.cooldown = 0;
+  f.combo = 0; f.comboTimer = 0; f.hitStreak = 0; f.hitStreakTimer = 0;
+  f.invuln = 1.0; f.onPlatform = false;
+}
+
+/* ============================= AI 电脑对手 ============================= */
+function chooseAction(f, dist) {
+  const r = Math.random();
+  const canWave = f.energy >= WAVE_COST;
+  if (dist > 340) return canWave && r < 0.15 ? 'wave' : 'approach';
+  if (dist > 150) {
+    if (canWave && r < 0.18) return 'wave';
+    if (r < 0.30) return 'jump';
+    if (r < 0.40) return 'retreat';
+    if (r < 0.55) return 'idle';
+    return 'approach';
+  }
+  // 近距离：攻击占比调低，节奏放慢
+  if (r < 0.30) return 'punch';
+  if (r < 0.52) return 'kick';
+  if (canWave && r < 0.60) return 'wave';
+  if (r < 0.75) return 'retreat';
+  return 'idle';
+}
+
+function updateAI(f, foe, dt) {
+  if (f.ai.attackCooldown > 0) f.ai.attackCooldown -= dt;
+  if (f.state === 'hurt') { f.aiMove = 0; f.ai.block = false; return; }
+  f.ai.timer -= dt;
+  const dist = Math.abs(foe.body.position.x - f.body.position.x);
+  const dir = foe.body.position.x >= f.body.position.x ? 1 : -1;
+
+  // 反应格挡（对方出招且距离近）
+  if ((foe.state === 'punch' || foe.state === 'kick') && dist < 160) {
+    if (Math.random() < 0.5) { f.ai.block = true; f.aiMove = 0; return; }
+  }
+  f.ai.block = false;
+
+  if (f.ai.timer <= 0) {
+    f.ai.timer = 0.3 + Math.random() * 0.5; // 决策间隔拉长
+    f.ai.action = chooseAction(f, dist);
+    f.ai.move = 0;
+    switch (f.ai.action) {
+      case 'approach': f.ai.move = dir; break;
+      case 'retreat':  f.ai.move = -dir; break;
+      case 'jump':     f.ai.move = dir; tryJump(f); break;
+      case 'idle':     break;
+      case 'punch':
+      case 'kick':
+        if (f.ai.attackCooldown <= 0) {
+          startAttack(f, f.ai.action);
+          f.ai.attackCooldown = 0.5 + Math.random() * 0.5; // 攻击冷却，压频率
+          f.ai.move = dir;
+        } else { f.ai.move = dir; }
+        break;
+      case 'wave':
+        if (f.ai.attackCooldown <= 0) { fireWave(f); f.ai.attackCooldown = 0.6 + Math.random() * 0.5; }
+        break;
+    }
+  }
+
+  // 避坑跳：前方有悬崖就起跳
+  if (f.onGround && f.ai.move !== 0) {
+    for (const pit of currentMap.pits) {
+      const ahead = f.ai.move > 0 ? pit.x : pit.x + pit.w;
+      const d = ahead - f.body.position.x;
+      if (Math.sign(d) === Math.sign(f.ai.move) && Math.abs(d) < 50) tryJump(f);
+    }
+  }
+  f.aiMove = f.ai.move;
+}
+
+/* ============================= 落地检测（地面 / 墙） ============================= */
+function isGroundBody(b) { return b.kind === 'ground'; }
+const grounded = new Set();
+
+Events.on(engine, 'collisionStart', e => {
+  for (const p of e.pairs) {
+    if (p.bodyA.isFighter && isGroundBody(p.bodyB)) grounded.add(p.bodyA.id);
+    else if (p.bodyB.isFighter && isGroundBody(p.bodyA)) grounded.add(p.bodyB.id);
+  }
+});
+Events.on(engine, 'collisionEnd', e => {
+  for (const p of e.pairs) {
+    if (p.bodyA.isFighter && isGroundBody(p.bodyB)) grounded.delete(p.bodyA.id);
+    else if (p.bodyB.isFighter && isGroundBody(p.bodyA)) grounded.delete(p.bodyB.id);
+  }
+});
+
+/* ============================= 更新 ============================= */
+function updateFighter(f, foe, dt) {
+  f.facing = foe.body.position.x >= f.body.position.x ? 1 : -1;
+  if (f.cooldown > 0) f.cooldown -= dt;
+  if (f.hurtFlash > 0) f.hurtFlash -= dt;
+  if (f.invuln > 0) f.invuln -= dt;
+  if (f.comboTimer > 0) f.comboTimer -= dt; else f.combo = 0;
+  if (f.hitStreakTimer > 0) { f.hitStreakTimer -= dt; if (f.hitStreakTimer <= 0) f.hitStreak = 0; }
+  f.energy = Math.min(MAX_ENERGY, f.energy + ENERGY_REGEN * dt);
+  f.onGround = grounded.has(f.body.id) || f.onPlatform;
+
+  if (f.state === 'punch' || f.state === 'kick') {
+    f.stateTime += dt;
+    const a = f.attack;
+    if (a && !a.hitDone && f.stateTime >= a.active[0] && f.stateTime <= a.active[1]) {
+      if (hitTest(f, foe, a)) { a.hitDone = true; applyHit(foe, f, a); }
+    }
+    if (f.stateTime >= a.total) { f.state = 'idle'; f.cooldown = 0.12; f.attack = null; }
+  } else if (f.state === 'wave') {
+    f.stateTime += dt;
+    Body.setVelocity(f.body, { x: 0, y: f.body.velocity.y });
+    if (f.stateTime >= 0.28) { f.state = 'idle'; f.cooldown = 0.15; }
+  } else if (f.state === 'hurt') {
+    f.stateTime += dt;
+    Body.setVelocity(f.body, { x: f.body.velocity.x * 0.9, y: f.body.velocity.y });
+    if (f.stateTime >= 0.32) f.state = 'idle';
+  } else {
+    const wantBlock = f.onGround && (f.isAI ? f.ai.block : isDown(f, 'block'));
+    if (wantBlock) {
+      Body.setVelocity(f.body, { x: 0, y: f.body.velocity.y });
+      f.state = 'block';
+    } else {
+      let mv = 0;
+      if (f.isAI) mv = f.aiMove;
+      else {
+        if (isDown(f, 'left'))  mv -= 1;
+        if (isDown(f, 'right')) mv += 1;
+      }
+      Body.setVelocity(f.body, { x: mv * 5.4, y: f.body.velocity.y });
+      if (mv !== 0) f.walkPhase += dt * 10;
+      f.state = mv !== 0 ? 'walk' : 'idle';
+    }
+  }
+
+  f.dispHp += (f.hp - f.dispHp) * Math.min(1, dt * 8);
+}
+
+// 物理更新后：锁旋转、限位、单面平台、掉坑
+function postUpdate(f) {
+  const b = f.body;
+  Body.setAngle(b, 0);
+  Body.setAngularVelocity(b, 0);
+  if (b.position.x < 30 || b.position.x > W - 30)
+    Body.setPosition(b, { x: clamp(b.position.x, 30, W - 30), y: b.position.y });
+
+  platformLanding(f);
+
+  if (!gameOver && b.position.y > currentMap.killY) {
+    f.hp -= 40;
+    spawnBurst(b.position.x, b.position.y, '#ffffff', 22);
+    if (f.hp <= 0) { f.hp = 0; gameOver = true; winner = other(f); playKO(); }
+    else { respawnFighter(f); playFall(); }
+  }
+  f.prevY = b.position.y;
+}
+
+// 单面平台：只有从上方下落且脚踩到台面时才站上去
+function platformLanding(f) {
+  f.onPlatform = false;
+  const bottom = f.body.position.y + BH_HALF;
+  const prevBottom = f.prevY + BH_HALF;
+  for (const p of currentMap.platforms) {
+    if (Math.abs(f.body.position.x - p.x) > p.w / 2 + 24) continue;
+    if (f.body.velocity.y >= 0 && prevBottom <= p.y + 2 && bottom >= p.y) {
+      Body.setPosition(f.body, { x: f.body.position.x, y: p.y - BH_HALF });
+      Body.setVelocity(f.body, { x: f.body.velocity.x, y: 0 });
+      f.onPlatform = true;
+      break;
+    }
+  }
+}
+
+function updateProjectiles(dt) {
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const p = projectiles[i];
+    p.x += p.vx * dt;
+    p.life -= dt;
+    const b = other(p.owner).body.bounds;
+    if (p.x + p.r > b.min.x && p.x - p.r < b.max.x &&
+        p.y + p.r > b.min.y && p.y - p.r < b.max.y) {
+      applyHit(other(p.owner), p.owner, ATK.wave);
+      spawnBurst(p.x, p.y, p.owner.color, 16);
+      projectiles.splice(i, 1);
+      continue;
+    }
+    if (p.life <= 0 || p.x < -60 || p.x > W + 60) projectiles.splice(i, 1);
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+/* ============================= 绘制 ============================= */
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1a1e2e'); g.addColorStop(0.6, '#232a3d'); g.addColorStop(1, '#2c3550');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  for (let i = 0; i < 8; i++) {
+    const x = i * 180, w = 90, h = 120 + (i % 3) * 60;
+    ctx.fillRect(x, GROUND_Y - h, w, h);
+  }
+}
+
+function drawFloor() {
+  const fg = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+  fg.addColorStop(0, '#3a4460'); fg.addColorStop(1, '#232a3d');
+  ctx.fillStyle = fg; ctx.fillRect(0, GROUND_Y, W, GROUND_H);
+  ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(0, GROUND_Y, W, 2);
+}
+
+function drawMap() {
+  const fg = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+  fg.addColorStop(0, '#3a4460'); fg.addColorStop(1, '#232a3d');
+  ctx.fillStyle = fg;
+  for (const seg of currentMap.groundSegs) ctx.fillRect(seg.x - seg.w/2, GROUND_Y, seg.w, GROUND_H);
+
+  // 悬崖坑
+  for (const pit of currentMap.pits) {
+    const pg = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+    pg.addColorStop(0, 'rgba(0,0,0,0.75)'); pg.addColorStop(1, 'rgba(0,0,0,0.35)');
+    ctx.fillStyle = pg;
+    ctx.fillRect(pit.x, GROUND_Y, pit.w, H - GROUND_Y);
+  }
+
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  for (const seg of currentMap.groundSegs) ctx.fillRect(seg.x - seg.w/2, GROUND_Y, seg.w, 2);
+
+  // 平台
+  for (const p of currentMap.platforms) {
+    ctx.fillStyle = '#4a5578';
+    ctx.fillRect(p.x - p.w/2, p.y, p.w, 18);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.fillRect(p.x - p.w/2, p.y, p.w, 3);
+  }
+}
+
+function drawLimb(px, py, a1, a2, l1, l2, facing) {
+  const jx = px + facing * Math.cos(a1) * l1;
+  const jy = py + Math.sin(a1) * l1;
+  const ex = jx + facing * Math.cos(a1 + a2) * l2;
+  const ey = jy + Math.sin(a1 + a2) * l2;
+  ctx.moveTo(px, py); ctx.lineTo(jx, jy); ctx.lineTo(ex, ey);
+  return { x: ex, y: ey };
+}
+
+function drawFighter(f) {
+  const b = f.body, x = b.position.x, y = b.position.y;
+  const facing = f.facing, DOWN = Math.PI / 2;
+
+  if (f.invuln > 0) ctx.globalAlpha = Math.sin(performance.now() / 60) > 0 ? 0.45 : 0.8;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(x, GROUND_Y + 4, 30, 6, 0, 0, Math.PI * 2); ctx.fill();
+
+  if (f.hurtFlash > 0) {
+    ctx.fillStyle = `rgba(255,60,60,${0.25 * f.hurtFlash / 0.15})`;
+    ctx.beginPath(); ctx.arc(x, y, 62, 0, Math.PI * 2); ctx.fill();
+  }
+
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = f.color; ctx.lineWidth = 6;
+
+  let swing = 0, armSwing = 0;
+  const dead = f.hp <= 0;
+  if (dead) {
+    swing = 0; armSwing = 0;
+  } else if (f.state === 'walk') {
+    swing = Math.sin(f.walkPhase) * 0.5; armSwing = Math.sin(f.walkPhase + Math.PI) * 0.35;
+  } else if (f.state === 'idle') {
+    swing = Math.sin(performance.now() / 600) * 0.04; armSwing = -swing;
+  }
+
+  let fLegA1 = DOWN + swing, fLegA2 = -0.3;
+  let bLegA1 = DOWN - swing, bLegA2 = -0.3;
+  let fArmA1 = DOWN + 0.1 - armSwing, fArmA2 = -0.45;
+  let bArmA1 = DOWN - 0.1 + armSwing, bArmA2 = -0.45;
+
+  const extend = (f.state === 'punch' || f.state === 'kick') ? clamp(f.stateTime / 0.06, 0, 1) : 0;
+
+  if (f.state === 'punch') {
+    fArmA1 = lerp(DOWN + 0.1, 0.05, extend); fArmA2 = lerp(-0.45, 0, extend);
+  } else if (f.state === 'kick') {
+    fLegA1 = lerp(DOWN, 0.05, extend); fLegA2 = lerp(-0.3, 0, extend);
+    bArmA1 = lerp(bArmA1, DOWN + 1.1, extend);
+    fArmA1 = lerp(fArmA1, DOWN + 0.5, extend);
+  } else if (f.state === 'wave') {
+    fArmA1 = 0.05; fArmA2 = 0; bArmA1 = 0.05; bArmA2 = 0;
+    fLegA1 = DOWN + 0.15; fLegA2 = -0.35; bLegA1 = DOWN - 0.15; bLegA2 = -0.35;
+  } else if (f.state === 'block') {
+    fArmA1 = 0.3; fArmA2 = -1.5;   // 双臂护在身前
+    bArmA1 = 0.4; bArmA2 = -1.3;
+    fLegA1 = DOWN + 0.18; fLegA2 = -0.3;
+    bLegA1 = DOWN - 0.18; bLegA2 = -0.3;
+  } else if (f.state === 'hurt') {
+    fArmA1 = -0.6; bArmA1 = DOWN + 1.2;
+  } else if (dead) {
+    fLegA2 = -0.95; bLegA2 = -0.95;
+    fArmA1 = DOWN + 0.3; fArmA2 = 0.3;
+    bArmA1 = DOWN + 0.3; bArmA2 = 0.3;
+  }
+
+  const hipF = { x: x + facing * 6, y: y + 8 };
+  const hipB = { x: x - facing * 6, y: y + 8 };
+  const shF  = { x: x + facing * 6, y: y - 24 };
+  const shB  = { x: x - facing * 6, y: y - 24 };
+  const neck = { x: x, y: y - 27 };
+
+  ctx.beginPath();
+  const footF = drawLimb(hipF.x, hipF.y, fLegA1, fLegA2, 24, 24, facing);
+  const footB = drawLimb(hipB.x, hipB.y, bLegA1, bLegA2, 24, 24, facing);
+  ctx.moveTo(hipF.x, hipF.y); ctx.lineTo(neck.x, neck.y);
+  const fistF = drawLimb(shF.x, shF.y, fArmA1, fArmA2, 16, 16, facing);
+  drawLimb(shB.x, shB.y, bArmA1, bArmA2, 16, 16, facing);
+  ctx.stroke();
+
+  // 格挡护盾
+  if (f.state === 'block') {
+    ctx.beginPath();
+    ctx.arc(x + facing * 28, y - 10, 32, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(140,220,255,0.14)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(140,220,255,0.55)'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  const hx = x, hy = y - 40;
+  ctx.fillStyle = f.color;
+  ctx.beginPath(); ctx.arc(hx, hy, 14, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(hx, hy, 14, 0, Math.PI * 2); ctx.stroke();
+
+  ctx.fillStyle = f.color;
+  ctx.beginPath(); ctx.arc(fistF.x, fistF.y, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(footF.x, footF.y, 4, 0, Math.PI * 2); ctx.fill();
+
+  if (f.state === 'punch' && f.combo === 2) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(fistF.x, fistF.y, 10 + Math.sin(performance.now()/40) * 3, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  if (f.attack && f.attack.hitDone) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 3;
+    const a = f.attack;
+    const cx = x + facing * (a.range / 2 + 8), cy = y + a.yOff;
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, cy); ctx.lineTo(cx + 8, cy);
+    ctx.moveTo(cx, cy - 8); ctx.lineTo(cx, cy + 8);
+    ctx.stroke();
+  }
+
+  if (f.hitStreak >= 2 && f.hitStreakTimer > 0) {
+    ctx.fillStyle = '#ffd54f'; ctx.font = '800 24px system-ui, "Microsoft YaHei"';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(`${f.hitStreak} 连击!`, x, y - 70);
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+function drawProjectile(p) {
+  const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r * 3);
+  g.addColorStop(0, 'rgba(255,255,255,0.95)');
+  g.addColorStop(0.35, p.owner.color);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 3, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.7, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.fillStyle = p.color;
+    ctx.globalAlpha = clamp(p.life * 2.5, 0, 1);
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHealthBars() {
+  const bw = 380, bh = 44, top = 30;
+  drawBar(24, top, bw, bh, fighters[0], 1);
+  drawBar(W - 24 - bw, top, bw, bh, fighters[1], -1);
+}
+
+function drawBar(x, y, w, h, f, dir) {
+  ctx.fillStyle = '#e8eaf2'; ctx.font = '600 15px system-ui, "Microsoft YaHei"';
+  ctx.textAlign = dir === 1 ? 'left' : 'right'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(f.name, dir === 1 ? x + 2 : x + w - 2, y - 8);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(x, y, w, h, 11); ctx.fill();
+
+  const ratio = f.dispHp / f.maxHp;
+  const fw = w * ratio, fx = dir === 1 ? x : x + w - fw;
+  const g = ctx.createLinearGradient(x, y, x, y + h);
+  g.addColorStop(0, f.color); g.addColorStop(1, shade(f.color, -30));
+  ctx.fillStyle = g;
+  roundRect(fx, y, fw, h, 11); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
+  roundRect(x, y, w, h, 11); ctx.stroke();
+
+  const ey = y + h + 7, eh = 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(x, ey, w, eh, 5); ctx.fill();
+  const er = f.energy / MAX_ENERGY;
+  const ew = w * er, ex = dir === 1 ? x : x + w - ew;
+  ctx.fillStyle = '#7cf5ff';
+  roundRect(ex, ey, ew, eh, 5); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  roundRect(x, ey, w, eh, 5); ctx.stroke();
+}
+
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = clamp((n >> 16) + amt, 0, 255), g = clamp(((n >> 8) & 0xff) + amt, 0, 255), b = clamp((n & 0xff) + amt, 0, 255);
+  return `rgb(${r},${g},${b})`;
+}
+
+function drawHUD() {
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '700 15px system-ui, "Microsoft YaHei"';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(currentMap.name, W/2, 12);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = '13px system-ui, "Microsoft YaHei"';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+  ctx.fillText('红方: A/D 移动 · W 跳 · S 格挡 · F 拳 · G 踢 · H 气功波        蓝方: ←/→ 移动 · ↑ 跳 · ↓ 格挡 · K 拳 · L 踢 · J 气功波', W/2, H - 10);
+}
+
+function drawWin() {
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = winner.color;
+  ctx.font = '800 64px system-ui, "Microsoft YaHei"';
+  ctx.fillText('K.O.!', W/2, H/2 - 40);
+  ctx.fillStyle = '#e8eaf2'; ctx.font = '600 30px system-ui, "Microsoft YaHei"';
+  ctx.fillText(`${winner.name} 获胜！`, W/2, H/2 + 30);
+  ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.font = '18px system-ui, "Microsoft YaHei"';
+  ctx.fillText('按 R 重新开始 · 按 Esc 返回菜单', W/2, H/2 + 80);
+}
+
+function drawMenu() {
+  drawBackground(); drawFloor();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ff5252'; ctx.font = '800 76px system-ui, "Microsoft YaHei"';
+  ctx.fillText('火 柴 人 格 斗', W/2, H/2 - 140);
+  ctx.fillStyle = '#e8eaf2'; ctx.font = '600 26px system-ui, "Microsoft YaHei"';
+  ctx.fillText('S T I C K   F I G H T E R', W/2, H/2 - 82);
+
+  ctx.font = '600 30px system-ui, "Microsoft YaHei"';
+  ctx.fillStyle = '#ffd54f'; ctx.fillText('按 1 — 双人对战', W/2, H/2 - 10);
+  ctx.fillStyle = '#7cf5ff'; ctx.fillText('按 2 — 单人打电脑', W/2, H/2 + 40);
+
+  ctx.font = '15px system-ui, "Microsoft YaHei"';
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.fillText('红方: A/D 移动 · W 跳 · S 格挡 · F 拳(连按三段) · G 踢 · H 气功波', W/2, H/2 + 130);
+  ctx.fillText('蓝方: ←/→ 移动 · ↑ 跳 · ↓ 格挡 · K 拳(连按三段) · L 踢 · J 气功波', W/2, H/2 + 160);
+}
+
+function drawMapSelect() {
+  drawBackground(); drawFloor();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#e8eaf2'; ctx.font = '600 42px system-ui, "Microsoft YaHei"';
+  ctx.fillText('选择地图', W/2, H/2 - 130);
+  ctx.font = '600 28px system-ui, "Microsoft YaHei"';
+  ctx.fillStyle = '#ffd54f'; ctx.fillText('按 1 — 擂台', W/2, H/2 - 30);
+  ctx.fillStyle = '#7cf5ff'; ctx.fillText('按 2 — 平台', W/2, H/2 + 25);
+  ctx.fillStyle = '#ff8a80'; ctx.fillText('按 3 — 悬崖（掉下去扣血）', W/2, H/2 + 80);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.font = '16px system-ui, "Microsoft YaHei"';
+  ctx.fillText('按 Esc 返回', W/2, H/2 + 145);
+}
+
+/* ============================= 音效 ============================= */
+let actx = null;
+function initAudio() {
+  if (actx) return;
+  try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+}
+function blip(freq0, freq1, dur, vol, type = 'triangle') {
+  if (!actx) return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq0, actx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(freq1, actx.currentTime + dur);
+  g.gain.setValueAtTime(vol, actx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+  o.connect(g).connect(actx.destination);
+  o.start(); o.stop(actx.currentTime + dur + 0.02);
+}
+const playHit   = () => blip(180, 55, 0.14, 0.4);
+const playBlock = () => blip(260, 160, 0.07, 0.28, 'square');
+const playWave  = () => blip(300, 900, 0.25, 0.25, 'sawtooth');
+const playFall  = () => blip(600, 120, 0.4, 0.3, 'sawtooth');
+const playKO    = () => { blip(440, 110, 0.3, 0.4); setTimeout(() => blip(330, 82, 0.5, 0.4), 180); };
+
+/* ============================= 主循环 ============================= */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+
+  if (screen === 'game') {
+    if (hitStop > 0) hitStop -= dt;
+    else {
+      updateParticles(dt);
+      if (!gameOver) {
+        for (const f of fighters) {
+          if (f.isAI) updateAI(f, other(f), dt);
+          updateFighter(f, other(f), dt);
+        }
+        updateProjectiles(dt);
+        Engine.update(engine, dt * 1000);
+        for (const f of fighters) postUpdate(f);
+      } else {
+        Engine.update(engine, dt * 1000);
+        for (const f of fighters) postUpdate(f);
+      }
+    }
+  }
+
+  ctx.save();
+  if (shake > 0) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake *= 0.85; if (shake < 0.3) shake = 0;
+  }
+
+  if (screen === 'menu') drawMenu();
+  else if (screen === 'mapselect') drawMapSelect();
+  else {
+    drawBackground(); drawMap();
+    for (const f of fighters) drawFighter(f);
+    drawParticles();
+    for (const p of projectiles) drawProjectile(p);
+    drawHealthBars();
+    ctx.restore();
+    drawHUD();
+    if (gameOver) drawWin();
+  }
+  ctx.restore();
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
