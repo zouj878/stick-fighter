@@ -42,11 +42,6 @@
     touch-action: manipulation; -webkit-tap-highlight-color: transparent;
   }
   .mbtn:active { background: rgba(255,255,255,0.2); }
-
-  #rotateHint { display: none; position: fixed; inset: 0; z-index: 50;
-    background: rgba(0,0,0,0.88); color: #fff; font-size: 22px;
-    align-items: center; justify-content: center; text-align: center; }
-  @media (orientation: portrait) and (pointer: coarse) { #rotateHint { display: flex; } }
 </style>
 </head>
 <body>
@@ -76,7 +71,6 @@
     </div>
   </div>
 </div>
-<div id="rotateHint">请将手机横屏游玩 🔄</div>
 <script>
 /*!
  * matter-js 0.19.0 by @liabru
@@ -89,9 +83,9 @@
 /* ============================= 基础设置 ============================= */
 const { Engine, Bodies, Body, Composite, Events } = Matter;
 
-const W = 1280, H = 720;
-const GROUND_H = 40, GROUND_Y = H - GROUND_H; // 地面顶边 y = 680
+const GROUND_H = 40;                          // 地面高度
 const BH = 116, BH_HALF = 58;                 // 角色碰撞箱（高 / 半高）
+let W = 1280, H = 720, GROUND_Y = H - GROUND_H; // 世界尺寸（横屏 1280×720 / 竖屏 720×1280）
 
 const c = document.getElementById('c');
 c.width = W; c.height = H;
@@ -102,7 +96,34 @@ function fit() {
   c.style.width  = (W * s) + 'px';
   c.style.height = (H * s) + 'px';
 }
-addEventListener('resize', fit); fit();
+let lastPortrait = null;
+function applyViewport() {
+  const portrait = innerWidth < innerHeight;
+  W = portrait ? 720 : 1280;
+  H = portrait ? 1280 : 720;
+  GROUND_Y = H - GROUND_H;
+  c.width = W; c.height = H;
+  fit();
+}
+function onResize() {
+  const portrait = innerWidth < innerHeight;
+  fit();
+  if (lastPortrait === portrait) return;
+  lastPortrait = portrait;
+  applyViewport();
+  if (screen === 'game' && currentMap) {
+    currentMap = getMap(currentMapKey);
+    buildMap(currentMapKey);
+    fighters.forEach((f, i) => {
+      const s = currentMap.spawns[i];
+      Body.setPosition(f.body, { x: s.x, y: GROUND_Y - BH_HALF });
+      Body.setVelocity(f.body, { x: 0, y: 0 });
+    });
+  }
+}
+applyViewport();
+lastPortrait = innerWidth < innerHeight;
+addEventListener('resize', onResize);
 
 const engine = Engine.create({ gravity: { x: 0, y: 1.4 } });
 let staticBodies = [];
@@ -139,25 +160,27 @@ const ATK = {
 };
 
 // 地图定义：groundSegs 地面段 / platforms 平台(顶边y) / pits 悬崖坑 / killY 掉坑判定线
-const MAPS = {
-  arena: {
-    name: '擂台', killY: H + 200, spawns: [{ x: 360 }, { x: 920 }],
-    groundSegs: [{ x: W/2, w: W }], platforms: [], pits: [],
-  },
-  platform: {
-    name: '平台', killY: H + 200, spawns: [{ x: 260 }, { x: 1020 }],
-    groundSegs: [{ x: W/2, w: W }],
-    platforms: [{ x: 320, y: 560, w: 220 }, { x: 960, y: 560, w: 220 }, { x: 640, y: 470, w: 240 }],
-    pits: [],
-  },
-  cliff: {
-    name: '悬崖', killY: H + 30, spawns: [{ x: 280 }, { x: 1000 }],
-    groundSegs: [{ x: 290, w: 580 }, { x: 990, w: 580 }], // 中间留 120 宽的坑
-    platforms: [], pits: [{ x: 580, w: 120 }],
-  },
-};
+function getMap(key) {
+  return {
+    arena: {
+      name: '擂台', killY: H + 200, spawns: [{ x: W * 0.28 }, { x: W * 0.72 }],
+      groundSegs: [{ x: W / 2, w: W }], platforms: [], pits: [],
+    },
+    platform: {
+      name: '平台', killY: H + 200, spawns: [{ x: W * 0.20 }, { x: W * 0.80 }],
+      groundSegs: [{ x: W / 2, w: W }],
+      platforms: [{ x: W * 0.25, y: H - 160, w: W * 0.34 }, { x: W * 0.75, y: H - 160, w: W * 0.34 }, { x: W * 0.50, y: H - 250, w: W * 0.40 }],
+      pits: [],
+    },
+    cliff: {
+      name: '悬崖', killY: H + 30, spawns: [{ x: W * 0.22 }, { x: W * 0.78 }],
+      groundSegs: [{ x: W * 0.225, w: W * 0.45 }, { x: W * 0.775, w: W * 0.45 }],
+      platforms: [], pits: [{ x: W * 0.45, w: W * 0.10 }],
+    },
+  }[key];
+}
 
-let currentMap = MAPS.arena, currentMapKey = 'arena';
+let currentMap = null, currentMapKey = 'arena';
 
 /* ============================= 角色 ============================= */
 function createFighter(x, name, color, input, isAI) {
@@ -196,7 +219,7 @@ function other(f) { return f === fighters[0] ? fighters[1] : fighters[0]; }
 function buildMap(mapKey) {
   staticBodies.forEach(b => Composite.remove(engine.world, b));
   staticBodies = [];
-  const map = MAPS[mapKey];
+  const map = getMap(mapKey);
 
   const wl = Bodies.rectangle(-20, H/2, 40, H*2, { isStatic: true, label: 'wall' }); wl.kind = 'wall';
   const wr = Bodies.rectangle(W+20, H/2, 40, H*2, { isStatic: true, label: 'wall' }); wr.kind = 'wall';
@@ -211,7 +234,7 @@ function buildMap(mapKey) {
 }
 
 function startGame(m, mapKey) {
-  mode = m; currentMapKey = mapKey; currentMap = MAPS[mapKey];
+  mode = m; currentMapKey = mapKey; currentMap = getMap(mapKey);
   buildMap(mapKey);
   screen = 'game';
   fighters.forEach(f => Composite.remove(engine.world, f.body));
@@ -791,7 +814,7 @@ function drawParticles() {
 }
 
 function drawHealthBars() {
-  const bw = 380, bh = 44, top = 30;
+  const bw = Math.min(380, W * 0.30), bh = 44, top = 30;
   drawBar(24, top, bw, bh, fighters[0], 1);
   drawBar(W - 24 - bw, top, bw, bh, fighters[1], -1);
 }
@@ -836,10 +859,12 @@ function drawHUD() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
   ctx.fillText(currentMap.name, W/2, 12);
 
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.font = '13px system-ui, "Microsoft YaHei"';
-  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-  ctx.fillText('红方: A/D 移动 · W 跳 · S 格挡 · F 拳 · G 踢 · H 气功波        蓝方: ←/→ 移动 · ↑ 跳 · ↓ 格挡 · K 拳 · L 踢 · J 气功波', W/2, H - 10);
+  if (!isTouch) {
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '13px system-ui, "Microsoft YaHei"';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText('红方: A/D 移动 · W 跳 · S 格挡 · F 拳 · G 踢 · H 气功波        蓝方: ←/→ 移动 · ↑ 跳 · ↓ 格挡 · K 拳 · L 踢 · J 气功波', W/2, H - 10);
+  }
 }
 
 function drawWin() {
@@ -862,14 +887,16 @@ function drawMenu() {
   ctx.fillStyle = '#e8eaf2'; ctx.font = '600 26px system-ui, "Microsoft YaHei"';
   ctx.fillText('S T I C K   F I G H T E R', W/2, H/2 - 82);
 
-  ctx.font = '600 30px system-ui, "Microsoft YaHei"';
-  ctx.fillStyle = '#ffd54f'; ctx.fillText('按 1 — 双人对战', W/2, H/2 - 10);
-  ctx.fillStyle = '#7cf5ff'; ctx.fillText('按 2 — 单人打电脑', W/2, H/2 + 40);
+  if (!isTouch) {
+    ctx.font = '600 30px system-ui, "Microsoft YaHei"';
+    ctx.fillStyle = '#ffd54f'; ctx.fillText('按 1 — 双人对战', W/2, H/2 - 10);
+    ctx.fillStyle = '#7cf5ff'; ctx.fillText('按 2 — 单人打电脑', W/2, H/2 + 40);
 
-  ctx.font = '15px system-ui, "Microsoft YaHei"';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.fillText('红方: A/D 移动 · W 跳 · S 格挡 · F 拳(连按三段) · G 踢 · H 气功波', W/2, H/2 + 130);
-  ctx.fillText('蓝方: ←/→ 移动 · ↑ 跳 · ↓ 格挡 · K 拳(连按三段) · L 踢 · J 气功波', W/2, H/2 + 160);
+    ctx.font = '15px system-ui, "Microsoft YaHei"';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('红方: A/D 移动 · W 跳 · S 格挡 · F 拳(连按三段) · G 踢 · H 气功波', W/2, H/2 + 130);
+    ctx.fillText('蓝方: ←/→ 移动 · ↑ 跳 · ↓ 格挡 · K 拳(连按三段) · L 踢 · J 气功波', W/2, H/2 + 160);
+  }
 }
 
 function drawMapSelect() {
